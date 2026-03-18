@@ -1,0 +1,8 @@
+mediapipe==0.10.9
+opencv-python
+sounddevice
+scipy
+numpy
+mido
+python-rtmidi
+pygame
