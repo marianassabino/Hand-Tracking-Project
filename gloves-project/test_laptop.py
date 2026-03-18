@@ -20,12 +20,12 @@ def output_callback(outdata, frames, time, status):
         outdata[:] = 0
 
 try:
-    with sd.InputStream(samplerate=RATE, blocksize=CHUNK,
-                        device=23, channels=2,
-                        dtype='int16', callback=input_callback):
-        with sd.OutputStream(samplerate=RATE, blocksize=CHUNK,
-                             device=20, channels=2,
-                             dtype='int16', callback=output_callback):
+  with sd.InputStream(samplerate=RATE, blocksize=CHUNK,
+                    device=1, channels=2,
+                    dtype='int16', callback=input_callback):
+    with sd.OutputStream(samplerate=RATE, blocksize=CHUNK,
+                         device=3, channels=2,
+                         dtype='int16', callback=output_callback):
             print("✅ Speak into your laptop mic...")
             while True:
                 sd.sleep(100)

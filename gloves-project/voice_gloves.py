@@ -98,10 +98,10 @@ cap = cv2.VideoCapture(0)
 print("🎤 Starting Voice Gloves...")
 
 with sd.InputStream(samplerate=RATE, blocksize=CHUNK,
-                    device=26, channels=2,
+                    device=17, channels=2,
                     dtype='int16', callback=input_callback):
     with sd.OutputStream(samplerate=RATE, blocksize=CHUNK,
-                         device=27, channels=2,
+                         device=14, channels=2,
                          dtype='int16', callback=output_callback):
         print("✅ Audio active! Show your hand!")
 
