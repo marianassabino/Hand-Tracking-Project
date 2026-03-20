@@ -1,102 +1,174 @@
+# soundgloves.py
+# Main loop for SoundGloves — Imogen Heap Mi.Mu glove simulator
+# Requires: mediapipe, opencv-python, voicemeeterlib, python-rtmidi
+#
+# Run from the src/ folder:
+#   python soundgloves.py
+
 import cv2
 import mediapipe as mp
-import voicemeeterlib
+import time
+import sys
 
-# setup
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7)
-
-cap = cv2.VideoCapture(0)
-
-# colors for each finger (BGR)
-colors = [
-    (0, 150, 255),   # thumb  - orange
-    (200, 255, 0),   # index  - cyan
-    (255, 0, 200),   # middle - purple
-    (150, 0, 255),   # ring   - pink
-    (255, 150, 0),   # pinky  - blue
-]
-
-fingertip_ids = [4, 8, 12, 16, 20]
+import gesture_engine
+import effect_map
+import midi_out
+import overlay
 
 
-def get_fingers(lm):
-    fingers = []
-    fingers.append(1 if lm[4].x < lm[3].x else 0)
-    for tip in [8, 12, 16, 20]:
-        fingers.append(1 if lm[tip].y < lm[tip - 2].y else 0)
-    return fingers
+# ─── startup ──────────────────────────────────────────────────────────────────
+
+def _connect_all() -> bool:
+    """Initialise MIDI and VoiceMeeter. Returns False if either fails."""
+    ok_midi = midi_out.connect("loopMIDI")
+    if not ok_midi:
+        print("[soundgloves] WARNING: LoopMIDI port not found — "
+              "MIDI effects (Valhalla, TAL-Vocoder) will be silent.\n"
+              "  Open LoopMIDI and create a port, then restart.")
+
+    try:
+        effect_map.init_voicemeeter()
+        ok_vm = True
+    except Exception as e:
+        print(f"[soundgloves] WARNING: VoiceMeeter connection failed: {e}\n"
+              "  Make sure VoiceMeeter Banana is open, then restart.")
+        ok_vm = False
+
+    return ok_midi and ok_vm
 
 
-def draw_hand(frame, lm, fingers):
-    h, w = frame.shape[:2]
-
-    # draw connections first
-    for a, b in mp_hands.HAND_CONNECTIONS:
-        x1, y1 = int(lm[a].x * w), int(lm[a].y * h)
-        x2, y2 = int(lm[b].x * w), int(lm[b].y * h)
-        cv2.line(frame, (x1, y1), (x2, y2), (180, 180, 180), 2)
-
-    # draw all joints
-    for i, point in enumerate(lm):
-        x, y = int(point.x * w), int(point.y * h)
-        if i in fingertip_ids:
-            fi = fingertip_ids.index(i)
-            size = 18 if fingers[fi] else 10
-            cv2.circle(frame, (x, y), size, colors[fi], -1)
-            if fingers[fi]:
-                cv2.circle(frame, (x, y), size + 4, colors[fi], 2)
-        else:
-            cv2.circle(frame, (x, y), 6, (180, 180, 180), -1)
+def _parse_hands(results) -> dict:
+    """
+    Return {'left': landmarks | None, 'right': landmarks | None}
+    Keyed by handedness label so index order never matters.
+    """
+    hands = {"left": None, "right": None}
+    if not results.multi_hand_landmarks:
+        return hands
+    for lm, handed in zip(
+        results.multi_hand_landmarks,
+        results.multi_handedness,
+    ):
+        label = handed.classification[0].label.lower()  # "left" or "right"
+        hands[label] = lm
+    return hands
 
 
-def update_voicemeeter(vm, fingers, wrist_y):
-    # index = reverb on/off
-    vm.strip[0].eq.on = bool(fingers[1])
+# ─── main loop ────────────────────────────────────────────────────────────────
 
-    # middle = mute
-    vm.strip[0].mute = bool(fingers[2])
+def main():
+    print("=" * 48)
+    print("  SoundGloves  —  starting up")
+    print("=" * 48)
 
-    # ring = gain up, pinky = gain down
-    if fingers[3]:
-        vm.strip[0].gain = 6.0
-    elif fingers[4]:
-        vm.strip[0].gain = -6.0
-    else:
-        vm.strip[0].gain = 0.0
+    all_connected = _connect_all()
+    if not all_connected:
+        print("[soundgloves] Running in partial mode — some effects inactive.")
 
-    # hand height controls master volume
-    vol = round((1.0 - wrist_y) * 10 - 5, 1)
-    vm.bus[0].gain = max(-10.0, min(6.0, vol))
+    # MediaPipe hands
+    mp_hands   = mp.solutions.hands
+    hands_model = mp_hands.Hands(
+        max_num_hands=2,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.6,
+        model_complexity=1,
+    )
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[soundgloves] ERROR: Could not open webcam.")
+        sys.exit(1)
+
+    # Optional: set capture resolution for better performance
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
+
+    print("[soundgloves] Running — press Q to quit.\n")
+
+    # Timing
+    prev_time = time.time()
+    fps        = 0.0
+
+    # Last known state (used when no hands detected — holds display steady)
+    gesture_state = {
+        "left":  {"gesture": "none", "wrist_y": 0.5, "spread": 0.0},
+        "right": {"gesture": "none", "wrist_y": 0.5, "pinch":  0.0},
+    }
+    applied = {}
+
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                print("[soundgloves] Frame read failed — camera disconnected?")
+                break
+
+            # Flip so it feels like a mirror
+            frame = cv2.flip(frame, 1)
+            h, w  = frame.shape[:2]
+
+            # ── hand tracking ──────────────────────────────────────────────
+            rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False          # perf: lock buffer for MP
+            results = hands_model.process(rgb)
+            rgb.flags.writeable = True
+
+            hands = _parse_hands(results)
+
+            # ── gesture → numbers ──────────────────────────────────────────
+            gesture_state = gesture_engine.process(hands)
+
+            # ── numbers → audio effects ────────────────────────────────────
+            try:
+                applied = effect_map.apply(gesture_state)
+            except Exception as e:
+                # Don't crash the visual loop if audio hiccups
+                print(f"[effect_map] {e}")
+                applied = {}
+
+            # ── draw ───────────────────────────────────────────────────────
+            # One draw_hand call per detected hand
+            if results.multi_hand_landmarks:
+                for lm, handed in zip(
+                    results.multi_hand_landmarks,
+                    results.multi_handedness,
+                ):
+                    side  = handed.classification[0].label          # "Left"/"Right"
+                    label = gesture_state[side.lower()].get("gesture", side.lower())
+                    frame = overlay.draw_hand(frame, lm, label)
+
+            # HUD: parameter bars + mute indicator
+            frame = overlay.draw_hud(frame, gesture_state, applied)
+
+            # FPS counter (top-right, small)
+            now       = time.time()
+            fps       = 0.9 * fps + 0.1 * (1.0 / max(now - prev_time, 1e-6))
+            prev_time = now
+            cv2.putText(
+                frame,
+                f"{fps:.0f} fps",
+                (w - 72, 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (160, 160, 160),
+                1,
+                cv2.LINE_AA,
+            )
+
+            cv2.imshow("SoundGloves", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                print("[soundgloves] Q pressed — shutting down.")
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        hands_model.close()
+        effect_map.shutdown_voicemeeter()
+        midi_out.close()
+        print("[soundgloves] Clean shutdown.")
 
 
-effect_names = ["Thumb", "Reverb", "Mute", "Gain+", "Gain-"]
-
-print("starting soundgloves...")
-
-with voicemeeterlib.api('banana') as vm:
-    while True:
-        ret, frame = cap.read()
-        frame = cv2.flip(frame, 1)
-        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-        if results.multi_hand_landmarks:
-            for hand in results.multi_hand_landmarks:
-                lm = hand.landmark
-                fingers = get_fingers(lm)
-
-                draw_hand(frame, lm, fingers)
-                update_voicemeeter(vm, fingers, lm[0].y)
-
-                for i, (name, val) in enumerate(zip(effect_names, fingers)):
-                    color = colors[i] if val else (100, 100, 100)
-                    cv2.putText(frame, f"{name}: {'on' if val else 'off'}",
-                                (10, 30 + i * 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
-
-        cv2.imshow("soundgloves", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
